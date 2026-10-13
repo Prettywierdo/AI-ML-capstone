@@ -1,0 +1,490 @@
+import streamlit as st
+import pandas as pd
+import joblib
+import numpy as np
+from pathlib import Path
+BASE = Path(__file__).parent
+
+st.set_page_config(page_title="TasteMatch", page_icon="🎧", layout="centered",)
+
+
+# --- TASTEMATCH THEME ---
+st.markdown("""
+<style>
+/* Moody purple and blue background */
+.stApp {
+    background:
+        radial-gradient(
+            circle at 10% 10%,
+            rgba(112, 55, 180, 0.25),
+            transparent 35%
+        ),
+        radial-gradient(
+            circle at 90% 80%,
+            rgba(40, 90, 190, 0.22),
+            transparent 40%
+        ),
+        linear-gradient(
+            135deg,
+            #090714 0%,
+            #17112c 50%,
+            #080d1b 100%
+        );
+    color: #f5f3ff;
+}
+
+/* Main page spacing */
+.block-container {
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+}
+
+/* Headings */
+h1, h2, h3 {
+    color: #e2d4ff !important;
+}
+
+/* Regular text */
+.stApp p,
+.stApp label {
+    color: #e5e1f5;
+}
+
+/* Input fields */
+.stTextInput input,
+.stTextArea textarea {
+    background-color: #171329;
+    color: #ffffff;
+    border: 1px solid #453568;
+    border-radius: 10px;
+}
+
+/* Buttons */
+.stButton button,
+.stFormSubmitButton button {
+    background: linear-gradient(90deg, #7c3aed, #4361ee);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+
+/* Button hover effect */
+.stButton button:hover,
+.stFormSubmitButton button:hover {
+    border: 1px solid #c4b5fd;
+    box-shadow: 0 0 15px rgba(124, 58, 237, 0.35);
+}
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background-color: #0d0a1b;
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 12px;
+}
+
+.stTabs [aria-selected="true"] {
+    color: #c4b5fd;
+    border-bottom-color: #8b5cf6;
+}
+
+/* Form containers */
+[data-testid="stForm"] {
+    background-color: rgba(24, 18, 46, 0.65);
+    border: 1px solid rgba(167, 139, 250, 0.22);
+    border-radius: 16px;
+    padding: 20px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# --- USER LOGIN ---
+from supabase import create_client
+
+if "supabase" not in st.session_state:
+    st.session_state.supabase = create_client(
+        st.secrets["SUPABASE_URL"],
+        st.secrets["SUPABASE_KEY"]
+    )
+
+db = st.session_state.supabase
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if st.session_state.user is None:
+    st.title("Welcome to TasteMatch")
+
+    login_tab, signup_tab = st.tabs(["Log in", "Create account"])
+
+    with login_tab:
+        with st.form("login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            login = st.form_submit_button("Log in")
+        
+
+        if login:
+            try:
+                result = db.auth.sign_in_with_password({
+                    "email": email,
+                    "password": password
+                })
+                st.session_state.user = result.user
+                st.rerun()
+            except Exception:
+                st.error("Login failed. Check your details.")
+
+    with signup_tab:
+        with st.form("signup_form"):
+            display_name = st.text_input("Your name")
+            email = st.text_input("Email", key="signup_email")
+            password = st.text_input(
+                "Create a password",
+                type="password",
+                key="signup_password"
+            )
+            signup = st.form_submit_button("Create account")
+
+            if signup:
+                if not display_name.strip() or not email.strip():
+                 st.warning("Enter your name and email.")
+            elif len(password) < 8:
+                st.warning("Use a password of at least 8 characters.")
+            else:
+                try:
+                    result = db.auth.sign_up({
+                        "email": email,
+                        "password": password,
+                        "options": {
+                            "data": {"display_name": display_name}
+                        }
+                        }
+                    )
+                    
+                    if result.session:
+                        st.session_state.user = result.user
+                        st.rerun()
+                    else:
+                        st.success(
+                            "Account created! Check your email to confirm, "
+                            "then log in."
+                        )
+                except Exception:
+                    st.error("Could not create account. Check your details.")
+                
+
+    st.stop()
+user = st.session_state.user
+user_id = user.id
+
+st.sidebar.write(f"Signed in as **{user.email}**")
+
+if st.sidebar.button("Log out"):
+    db.auth.sign_out()
+    st.session_state.user = None
+    st.session_state.pop("selected_songs", None)
+    st.rerun()
+
+# --- LOAD USER PROFILE ---
+profile_result = (
+    db.table("user_profiles")
+    .select("*")
+    .eq("user_id", user_id)
+    .execute()
+)
+
+if profile_result.data:
+    saved_profile = profile_result.data[0]
+else:
+    saved_profile = {
+        "user_id": user_id,
+        "display_name": user.user_metadata.get(
+            "display_name", user.email
+        ),
+        "movie_preferences": {},
+        "music_preferences": {}
+    }
+
+    db.table("user_profiles").insert(saved_profile).execute()
+
+movie_preferences = saved_profile.get("movie_preferences") or {}
+music_preferences = saved_profile.get("music_preferences") or {}
+
+with st.sidebar:
+    st.title("About this model")
+
+    st.subheader("Movie Model")
+    st.write("**Algorithm:** K-Means Clustering")
+    st.write("**Input:** Movie genres")
+    st.write("**Output:** Movie taste groups")
+    st.write("**Purpose:** Groups movies with similar genres.")
+
+    st.divider()
+
+    st.subheader("Music Model")
+    st.write("**Algorithm:** K-Means Clustering")
+    st.write("**Input:** Music features")
+    st.write("**Output:** Music taste groups")
+    st.write("**Purpose:** Groups songs with similar characteristics.")
+
+    st.info(
+        "This app explores similarities in movie and music preferences."
+        " It uses K-Means clustering to group movies and songs based on their features."
+        "It Recommends based on the features used by each model."
+    )
+
+
+st.title("🎬 TasteMatch 🎧")
+st.subheader("Discover movies and music that match your taste.")
+
+
+
+# Create the two tabs
+movie_tab, music_tab = st.tabs(["🎬 Movies", "🎵 Music"], width= 700)
+
+
+
+# Movie tab
+with movie_tab:
+    st.subheader("Movie Taste Finder")
+    st.write("Find your movie taste")
+    movie_data =joblib.load(BASE / "movies" / "movie_model.pkl")
+    movies = pd.read_csv(BASE / "movies" / "clustered_movies.csv")
+   
+
+    kmeans = movie_data["kmeans"]
+    scaler = movie_data["scaler"]
+    features = movie_data["features"]
+    cluster_names = movie_data["cluster_names"]
+    genre_columns = movie_data["genre_columns"]
+
+    genre_options = sorted(genre_columns)
+     
+    chosen = st.multiselect(
+        "Choose genres you enjoy",
+        genre_options,
+        default=[
+            g for g in movie_preferences.get("genres", [])
+            if g in genre_options
+        ]
+    )
+
+    if st.button("Save my movie preferences"):
+        db.table("user_profiles").update({
+            "movie_preferences": {"genres": chosen}
+        }).eq("user_id", user_id).execute()
+
+        st.success("Movie preferences saved!")
+        st.rerun()
+
+   
+    if st.button("Find my movie group", key="movie_button"):
+        if not chosen:
+            st.warning("Please select at least one genre.")
+        else:
+                # Load the original movie features
+                original_data = pd.read_csv(
+                    BASE / "movies" / "data.csv"
+                )
+
+                # Create a profile using numerical averages
+                profile = {}
+
+                for feature in features:
+                    if feature in genre_columns:
+                        profile[feature] = int(feature in chosen)
+                    elif feature in original_data.columns:
+                        profile[feature] = original_data[feature].mean()
+                    else:
+                        profile[feature] = 0
+
+                # Arrange features in the training order
+                user_data = pd.DataFrame(
+                    [[profile[f] for f in features]],
+                    columns=features
+                )
+
+                # Use the original fitted scaler and K-Means
+                user_scaled = scaler.transform(user_data)
+                cluster = int(kmeans.predict(user_scaled)[0])
+
+                name = cluster_names.get(
+                    cluster, f"Cluster {cluster}"
+                )
+
+                st.success(f"Your movie group: {name}")
+
+                recommendations = movies[
+                    movies["Cluster"] == cluster
+                ]
+
+                display_columns = [
+                    col for col in [
+                        "Movie Name", "Genre",
+                        "Movie Rating", "Year of Release"
+                    ] if col in recommendations.columns
+                ]
+
+                st.dataframe(
+                    recommendations[display_columns]
+                    .head(25),
+                    hide_index=True
+                )
+
+
+with music_tab:
+    st.subheader("Music Taste Finder")
+    st.write("Find Your Music Taste 🎵")
+    st.write("Add 3–5 songs you love, and we'll discover your music taste!")
+
+    # Load your music dataset and trained model
+    music = pd.read_csv(BASE / "models" / "clustered_music.csv")
+
+    kmeans = joblib.load(BASE / "models" / "music_kmeans.pkl")
+    scaler = joblib.load(BASE / "models" / "music_scaler.pkl")
+    features = joblib.load(BASE / "models" / "music_features.pkl")
+    cluster_names = joblib.load(BASE / "models" / "music_cluster_names.pkl")
+
+    # Create labels people can recognize
+    music["song_choice"] = (
+        music["track_name"].fillna("Unknown") + " — " +
+        music["artists"].fillna("Unknown") + " (" +
+        music["track_genre"].fillna("Unknown") + ")"
+    )
+
+    # Remember selected songs when the app refreshes
+    if "selected_songs" not in st.session_state:
+        st.session_state.selected_songs = [
+        song for song in music_preferences.get("songs", [])
+        if song in set(music["song_choice"])
+    ]
+
+    st.write(
+        f"Songs selected: {len(st.session_state.selected_songs)}/5"
+    )
+
+    # Search by song title or artist
+    search = st.text_input(
+        "Search for a song or artist",
+        placeholder="e.g. Wizkid, Adele, Calm Down..."
+    )
+
+    if search:
+        results = music[
+            music["song_choice"].str.contains(
+                search, case=False, na=False, regex=False
+            )
+        ]["song_choice"].drop_duplicates().head(100).tolist()
+
+        if results:
+            chosen_song = st.selectbox(
+                "Choose a matching song",
+                results,
+                key="music_search_result"
+            )
+
+            if st.button("Add song"):
+                if chosen_song in st.session_state.selected_songs:
+                    st.warning("You've already added that song.")
+                elif len(st.session_state.selected_songs) >= 5:
+                    st.warning("You can select a maximum of 5 songs.")
+                else:
+                    st.session_state.selected_songs.append(chosen_song)
+                    st.rerun()
+        else:
+            st.info("No matches found. Try another song or artist.")
+
+    # Display selected songs
+    if st.session_state.selected_songs:
+        st.subheader("Your selected songs")
+
+        for song in st.session_state.selected_songs:
+            st.write(f"🎵 {song}")
+
+        if st.button("Clear selected songs"):
+            st.session_state.selected_songs = []
+            st.rerun()
+
+        if st.button("Save my music preferences"):
+         db.table("user_profiles").update({
+        "music_preferences": {
+            "songs": st.session_state.selected_songs
+        }
+            }).eq("user_id", user_id).execute()
+         st.success("Music preferences saved!")
+         st.rerun()
+
+    # Predict taste from all selected songs
+    if st.button("Find My Music Taste", key="music_button"):
+        if len(st.session_state.selected_songs) < 3:
+            st.warning("Please add at least 3 songs first.")
+        else:
+            selected = music[
+                music["song_choice"].isin(
+                    st.session_state.selected_songs
+                )
+            ].drop_duplicates("song_choice")
+
+            # Create one profile from the selected songs
+            profile = selected[features].mean().to_frame().T
+
+            # Predict the user's overall music group
+            scaled_profile = scaler.transform(profile)
+            cluster = int(kmeans.predict(scaled_profile)[0])
+
+            name = cluster_names.get(cluster, f"Group {cluster}")
+            st.success(f"Your music taste: {name}")
+
+            # Recommend songs from the predicted group
+            
+# Recommend songs based on the selected songs' audio features
+            selected_features = selected[features]
+
+            # Scale the selected songs using the existing scaler
+            selected_scaled = scaler.transform(selected_features)
+
+            # Find the user's average music profile
+            user_profile = selected_scaled.mean(axis=0)
+
+            # Scale all songs using the same scaler
+            all_scaled = scaler.transform(music[features])
+
+            # Calculate how close each song is to the user's profile
+            distances = np.linalg.norm(
+                all_scaled - user_profile,
+                axis=1
+            )
+
+            music["distance"] = distances
+
+            # Remove songs the user already selected
+            recommendations = music[
+                ~music["song_choice"].isin(
+                    st.session_state.selected_songs
+                )
+            ].copy()
+
+            # Closest songs first
+            recommendations = recommendations.sort_values(
+                "distance",
+                ascending=True
+            )
+
+            st.subheader("Songs picked for your taste 🎶")
+
+            columns = [
+                col for col in
+                ["track_name", "artists", "track_genre"]
+                if col in recommendations.columns
+            ]
+
+            st.dataframe(
+                recommendations[columns].drop_duplicates().head(25),
+                hide_index=True
+            )
